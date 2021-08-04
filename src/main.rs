@@ -1,4 +1,5 @@
 mod spdx_spec;
+mod protos;
 
 extern crate serde;
 #[macro_use]
@@ -18,6 +19,7 @@ use std::io::BufReader;
 use std::io::Error;
 use std::path::Path;
 use std::process::Command;
+use protos::bom_1_3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Package {
@@ -299,7 +301,7 @@ impl SpdxSchema {
 }
 
 fn main() -> Result<(), Error> {
-    let matches = App::new("SPDNix")
+    let matches = App::new("Nixbom")
         .version("0.1")
         .author("Michael Lieberman and Jack Kelly")
         .arg(
