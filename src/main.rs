@@ -1,4 +1,9 @@
 mod spdx_spec;
+mod protos;
+mod sbom;
+mod nix;
+use protobuf::text_format::print_to_string;
+
 
 extern crate serde;
 #[macro_use]
@@ -7,6 +12,8 @@ extern crate serde_json;
 
 use chrono::prelude::*;
 use clap::{App, Arg};
+use nix::Package;
+use protobuf::RepeatedField;
 use spdx_spec::CreationInfo;
 use spdx_spec::Document;
 use spdx_spec::Package as SPDXPackage;
@@ -18,130 +25,8 @@ use std::io::BufReader;
 use std::io::Error;
 use std::path::Path;
 use std::process::Command;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Package {
-    name: String,
-    pname: String,
-    version: String,
-    meta: Meta,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Meta {
-    license: Option<Licenses>,
-    description: Option<String>,
-    homepage: Option<Homepages>,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum Homepages {
-    Homepage(String),
-    HomepageList(Vec<String>),
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum Licenses {
-    License(License),
-    LicenseList(Vec<License>),
-    NameOnly(String),
-    NameOnlyList(Vec<String>),
-    SpecialCase(Vec<Licenses>),
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct License {
-    #[serde(rename = "fullName")]
-    full_name: Option<String>,
-    #[serde(rename = "shortName")]
-    short_name: Option<String>,
-    #[serde(rename = "spdxId")]
-    spdx_id: Option<String>,
-    url: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Out {
-    path: String,
-    #[serde(rename = "hashAlgo")]
-    hash_algo: Option<String>,
-    hash: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Drv {
-    outputs: HashMap<String, Out>,
-    #[serde(rename = "inputSrcs")]
-    input_srcs: Vec<String>,
-    #[serde(rename = "inputDrvs")]
-    input_drvs: HashMap<String, Vec<String>>,
-    system: String,
-    builder: String,
-    args: Vec<String>,
-    env: HashMap<String, String>,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
-trait Derivation {
-    fn get_inner_drv(&self) -> Vec<Drv>;
-    fn get_input_derivations(&self) -> Vec<Drv>;
-}
-
-impl Derivation for HashMap<String, Drv> {
-    fn get_inner_drv(&self) -> Vec<Drv> {
-        self.into_iter().map(|(_, v)| v.clone()).collect()
-    }
-
-    fn get_input_derivations(&self) -> Vec<Drv> {
-        self.get_inner_drv()
-            .into_iter()
-            .flat_map(|v| v.input_drvs.clone())
-            .map(|(k, _)| k)
-            .collect::<Vec<String>>()
-            .into_iter()
-            .flat_map(|v| serde_json::from_value(get_derivation_json(&v, false).unwrap()))
-            .collect::<Vec<HashMap<String, Drv>>>()
-            .into_iter()
-            .flat_map(|v| v.get_inner_drv())
-            .collect::<Vec<Drv>>()
-    }
-}
-
-fn get_derivation_json(file: &str, is_expression: bool) -> Result<serde_json::Value, Error> {
-    let output_bytes = get_derivation_bytes(file, is_expression)?;
-    let json = bytes_to_json(output_bytes)?;
-    Ok(json)
-}
-
-fn get_derivation_bytes(file: &str, is_expression: bool) -> Result<Vec<u8>, Error> {
-    let output = if is_expression {
-        Command::new("nix")
-            .arg("show-derivation")
-            .arg("-f")
-            .arg(file)
-            .output()
-    } else {
-        Command::new("nix")
-            .arg("show-derivation")
-            .arg(file)
-            .output()
-    }?;
-
-    Ok(output.stdout)
-}
-
-fn bytes_to_json(bytes: Vec<u8>) -> serde_json::Result<serde_json::Value> {
-    let v = serde_json::from_slice(&bytes)?;
-
-    Ok(v)
-}
+use uuid::Uuid;
+use nix::{Drv, Derivation, get_derivation_json};
 
 fn get_packages_wrapper(with_cache: bool) -> Result<HashMap<String, Package>, Error> {
     if with_cache {
@@ -191,115 +76,10 @@ fn get_packages_cached(path: &str) -> Result<HashMap<String, Package>, Error> {
     Ok(mapped)
 }
 
-trait SpdxPackages {
-    fn get_spdx_package_info_if_exists(&self, package: String) -> Option<SPDXPackage>;
-}
 
-fn license_helper(license: License) -> Option<String> {
-    license
-        .spdx_id
-        .or(license.full_name.or(license.short_name.or(license.url)))
-}
-
-impl SpdxPackages for HashMap<String, Package> {
-    fn get_spdx_package_info_if_exists(&self, package_name: String) -> Option<SPDXPackage> {
-        let package = self.get(&package_name)?;
-        let license = package
-            .meta
-            .license
-            .to_owned()
-            .map(|v| match v {
-                Licenses::License(l) => vec![license_helper(l)],
-                Licenses::LicenseList(l) => l.into_iter().map(|v| license_helper(v)).collect(),
-                Licenses::NameOnly(l) => vec![Some(l)],
-                Licenses::NameOnlyList(l) => l.into_iter().map(|v| Some(v)).collect(),
-                Licenses::SpecialCase(_) => vec![None], // TODO: Figure out what todo with special cases!
-            })
-            .into_iter()
-            .flatten()
-            .collect();
-
-        let homepage = {
-            package.meta.homepage.to_owned().map(|v| match v {
-                Homepages::Homepage(h) => h,
-                // Assume if a list of URLs pick the first one
-                Homepages::HomepageList(h) => h[0].clone(),
-            })
-        };
-        let s = SPDXPackage {
-            annotations: None,
-            attribution_texts: None,
-            checksums: None,
-            comment: None,
-            copyright_text: None,
-            description: package.meta.description.to_owned(),
-            download_location: None,
-            external_refs: None,
-            files_analyzed: None,
-            has_files: None,
-            homepage: homepage,
-            license_comments: None,
-            license_info_from_files: license,
-            name: None,
-            originator: None,
-            package_file_name: None,
-            package_verification_code: None,
-            source_info: None,
-            summary: None,
-            supplier: None,
-            version_info: Some(package.version.to_owned()),
-        };
-
-        Some(s)
-    }
-}
-
-impl SpdxSchema {
-    fn new(
-        name: String,
-        created: String,
-        creators: Vec<String>,
-        data_license: String,
-        materials: Vec<String>,
-        package_data: HashMap<String, Package>,
-    ) -> SpdxSchema {
-        let creation_info = CreationInfo {
-            comment: None,
-            created: Some(created),
-            creators: Some(creators),
-            license_list_version: None,
-        };
-
-        let packages = materials
-            .into_iter()
-            .flat_map(|v| package_data.get_spdx_package_info_if_exists(v))
-            .collect::<Vec<spdx_spec::Package>>();
-
-        let document = Document {
-            annotations: None,
-            comment: None,
-            creation_info: Some(creation_info),
-            data_license: Some(data_license),
-            describes_packages: None,
-            external_document_refs: None,
-            files: None, // TODO: Support file based SBOMs
-            has_extracted_licensing_infos: None,
-            name: Some(name),
-            packages: Some(packages),
-            relationships: None,
-            revieweds: None,
-            snippets: None,
-            spdx_version: Some("SPDX-2.2".to_string()), // TODO: Support multiple SPDX versions
-        };
-
-        SpdxSchema {
-            document: Some(document),
-        }
-    }
-}
 
 fn main() -> Result<(), Error> {
-    let matches = App::new("SPDNix")
+    let matches = App::new("Nixbom")
         .version("0.1")
         .author("Michael Lieberman and Jack Kelly")
         .arg(
@@ -364,6 +144,39 @@ fn main() -> Result<(), Error> {
         packages,
     );
 
+    /*let mut cyclonedx_sbom = bom_1_3::Bom::new();
+    cyclonedx_sbom.set_spec_version("1.3".to_string()); // TODO: Make this parameterizable
+    cyclonedx_sbom.set_serial_number(Uuid::new_v4().to_string());
+    cyclonedx_sbom.set_compositions(RepeatedField::from_vec(vec![]));*/
+
+    /*cyclonedxdx_sbom.set_metadata(bom_1_3::Metadata {
+        tools: (),
+        authors: (),
+        properties: (),
+        _timestamp: (),
+        _component: (),
+        _manufacture: (),
+        _supplier: (),
+        _licenses: (),
+        unknown_fields: (),
+        cached_size: (),
+    })*/
+/* 
+    let mut cyclonedx_sbom = bom_1_3::Bom {
+        spec_version: "1.3", // TODO: Parameterize this?
+        components: (),
+        services: (),
+        external_references: (),
+        dependencies: (),
+        compositions: (),
+        _version: 1,
+        _serial_number: (),
+        _metadata: (),
+        unknown_fields: (),
+        cached_size: (),
+    }*/
+
+    //println!("{}", serde_json::to_string(&cyclonedx_sbom).unwrap());
     println!("{}", serde_json::to_string_pretty(&sbom)?);
 
     Ok(())
