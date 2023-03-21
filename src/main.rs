@@ -124,12 +124,14 @@ fn get_derivation_bytes(file: &str, is_expression: bool) -> Result<Vec<u8>, Erro
     let output = if is_expression {
         Command::new("nix")
             .arg("show-derivation")
+            .arg("-r")
             .arg("-f")
             .arg(file)
             .output()
     } else {
         Command::new("nix")
             .arg("show-derivation")
+            .arg("-r")
             .arg(file)
             .output()
     }?;
