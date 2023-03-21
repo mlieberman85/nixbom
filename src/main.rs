@@ -299,7 +299,7 @@ impl SpdxSchema {
 }
 
 fn main() -> Result<(), Error> {
-    let matches = App::new("SPDNix")
+    let matches = App::new("nixbom")
         .version("0.1")
         .author("Michael Lieberman and Jack Kelly")
         .arg(
